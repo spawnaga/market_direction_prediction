@@ -1,5 +1,5 @@
 import datetime
-
+import matplotlib.pyplot as plt
 from sklearn.tree import DecisionTreeClassifier
 from sqlalchemy import create_engine
 import pandas as pd
@@ -25,6 +25,31 @@ from tensorflow.keras.callbacks import LearningRateScheduler
 import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"  # Use GPUs 0 and 1
+
+import matplotlib.pyplot as plt
+
+
+def plot_training_history(trainHistory, model_name):
+    # Plot training & validation accuracy values
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(trainHistory.history['accuracy'])
+    plt.plot(trainHistory.history['val_accuracy'])
+    plt.title(f'Model Accuracy - {model_name}')
+    plt.ylabel('Accuracy')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Test'], loc='upper left')
+
+    # Plot training & validation loss values
+    plt.subplot(1, 2, 2)
+    plt.plot(trainHistory.history['loss'])
+    plt.plot(trainHistory.history['val_loss'])
+    plt.title(f'Model Loss - {model_name}')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Test'], loc='upper left')
+
+    plt.show()
 
 
 def compute_order_book_features(df, depth=5):
@@ -70,7 +95,8 @@ class ModelTraining:
             self.df = pd.read_sql("SELECT * from NQ_market_depth", engine)
         if "time" in self.df.columns:
             self.df = self.df.drop("time", axis=1)
-        self.df = self.df.drop("lastSize", axis=1)
+        if "lastSize" in self.df.columns:
+            self.df = self.df.drop("lastSize", axis=1)
         self.early_stop = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=20)
         self.scaler = MinMaxScaler()
         self.logdir = "logs/fit/" + "agentLearning" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -185,7 +211,7 @@ class ModelTraining:
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Add early_stop to callbacks
         )
 
-        return trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
+        return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
 
     def CNN_model(self):
         # Reshape input data to be 3D for Conv1D layers: [samples, time steps, features]
@@ -232,7 +258,7 @@ class ModelTraining:
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Use early_stop in callbacks
         )
 
-        return trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
+        return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
 
     def LSTM_model(self):
 
@@ -270,7 +296,7 @@ class ModelTraining:
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]
         )
 
-        return trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
+        return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
 
     def SimpleRNN_model(self):
         # Reshape input data to be 3D: [samples, time steps, features]
@@ -310,7 +336,7 @@ class ModelTraining:
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Use early_stop in callbacks
         )
 
-        return trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
+        return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
 
     def CNNRNN_model(self):
         # Ensure target variables are one-hot encoded
@@ -358,7 +384,7 @@ class ModelTraining:
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Include early_stop in callbacks
         )
 
-        return trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
+        return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
 
     def LSTMCNN_model(self):
         # Ensure target variables are one-hot encoded
@@ -407,11 +433,7 @@ class ModelTraining:
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Include early_stop in callbacks
         )
 
-        return trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
-
-    from xgboost import XGBClassifier
-    from sklearn.metrics import accuracy_score, log_loss
-    from sklearn.model_selection import cross_val_score, StratifiedKFold
+        return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
 
     def check_and_convert_target_variable(self):
         # Check if the target variable contains more than two unique values
@@ -568,7 +590,13 @@ def huber_loss(y_true, y_pred):
 
 
 if __name__ == '__main__':
-    mt = ModelTraining(database_path="MarketDepth_data_sample.csv")
+    mt = ModelTraining(database_path="NQ_ticks.db")
     mt.preprocess_data()
-    accuracy, loss = mt.MLPClassifier_model()
+
+    # Train the Dense model and get its history
+    trainHistory, accuracy, loss = mt.Dense_model()
+
+    # Plot the training history
+    plot_training_history(trainHistory, "Dense")
+
     print(accuracy, loss)
