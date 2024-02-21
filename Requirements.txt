@@ -1,0 +1,8 @@
+ib_insync
+pandas~=2.2.0
+numpy~=1.26.4
+scikit-learn~=1.4.1.post1
+tensorflow~=2.15.0.post1
+DateTime~=5.4
+SQLAlchemy~=2.0.27
+xgboost~=2.0.3
