@@ -233,6 +233,8 @@ class ModelTraining:
         csv_filename = "preprocessed_data.csv"  # Define the name of your CSV file
         merged_df.to_csv(csv_filename, index=False)  # Save the DataFrame to a CSV file without the index
         print(f"Preprocessed data saved to {csv_filename}")
+        merged_df = merged_df.drop("future_mid_price", axis=1)
+        self.df = self.df.drop("future_mid_price", axis=1)
 
         # Select only the numerical columns (excluding 'time')
         numerical_columns = [col for col in self.df.columns if col != 'time']
@@ -280,7 +282,7 @@ class ModelTraining:
         output_layer = Dense(3, activation='softmax')(x)
 
         model = Model(inputs=input_layer, outputs=output_layer)
-        model.compile(loss='categorical_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+        model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
 
         # Configure the EarlyStopping callback
         early_stop = EarlyStopping(
@@ -327,13 +329,13 @@ class ModelTraining:
         model = Model(inputs=input_layer, outputs=output)
 
         # Compile the model
-        model.compile(loss='categorical_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+        model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
 
         # Configure the EarlyStopping callback to monitor validation accuracy
         early_stop = EarlyStopping(
             monitor='val_accuracy',
             min_delta=0.001,
-            patience=10,
+            patience=30,
             verbose=1,
             mode='max',
             restore_best_weights=True
@@ -365,7 +367,7 @@ class ModelTraining:
             output_layer = Dense(3, activation='softmax')(x)  # Use softmax for multi-class classification
 
             model = Model(inputs=input_layer, outputs=output_layer)
-            model.compile(loss='categorical_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+            model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
 
         # Configure the EarlyStopping callback to monitor validation accuracy
         early_stop = EarlyStopping(
@@ -405,7 +407,7 @@ class ModelTraining:
         model = Model(inputs=input_layer, outputs=output)
 
         # Compile the model
-        model.compile(loss='categorical_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+        model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
 
         # Configure the EarlyStopping callback to monitor validation accuracy
         early_stop = EarlyStopping(
@@ -453,7 +455,7 @@ class ModelTraining:
         model = Model(inputs=input_layer, outputs=output)
 
         # Compile the model
-        model.compile(loss='categorical_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+        model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
 
         # Configure the EarlyStopping callback
         early_stop = EarlyStopping(
@@ -502,7 +504,7 @@ class ModelTraining:
         model = Model(inputs=input_layer, outputs=output)
 
         # Compile the model
-        model.compile(loss='categorical_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+        model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
 
         # Configure the EarlyStopping callback
         early_stop = EarlyStopping(
@@ -536,36 +538,34 @@ class ModelTraining:
             self.y_test = label_encoder.transform(self.y_test)
 
     def xgboost_model(self):
-        # Check and convert target variable if necessary
-        self.check_and_convert_target_variable()
+        # Adjust y values for binary classification: map -1 to 0, keep 1 as is
+        y_train_adjusted = np.where(self.y_train == -1, 0, self.y_train)
+        y_test_adjusted = np.where(self.y_test == -1, 0, self.y_test)
 
-        # Initialize the XGBClassifier with specific parameters
+        # Initialize the XGBClassifier for binary classification
         self.model = XGBClassifier(
             use_label_encoder=False,
-            eval_metric='mlogloss',  # Use 'mlogloss' for multi-class log loss
-            n_estimators=100,  # Number of trees, change as needed
-            max_depth=6,  # Depth of each tree, change as needed
-            learning_rate=0.1,  # Step size shrinkage used to prevent overfitting. Range is [0,1]
-            subsample=0.8,  # Subsample ratio of the training instances, change as needed
-            colsample_bytree=0.8,  # Subsample ratio of columns when constructing each tree, change as needed
-            objective='binary:logistic'  # Specify binary classification
+            eval_metric='logloss',  # Use 'logloss' for binary log loss
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective='binary:logistic'  # For binary classification
         )
 
-        # Use cross-validation to evaluate model performance
-        kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        cv_results = cross_val_score(self.model, self.X_train, self.y_train, cv=kfold, scoring='accuracy')
-        print(f'XGBoost Cross-Validation Accuracy: {cv_results.mean()} (+/- {cv_results.std()})')
+        # Fit the model on the training data
+        self.model.fit(self.X_train, y_train_adjusted)
 
-        # Fit the model on the entire dataset
-        self.model.fit(self.X_train, self.y_train)
+        # Predict probabilities for the test set
+        y_pred_proba = self.model.predict_proba(self.X_test)[:, 1]  # Get probability for class '1'
 
-        # Predict probabilities and classes for the test set
-        y_pred_proba = self.model.predict_proba(self.X_test)
-        y_pred = self.model.predict(self.X_test)
+        # Calculate accuracy
+        y_pred = (y_pred_proba > 0.5).astype(int)  # Convert probabilities to class labels
+        accuracy = accuracy_score(y_test_adjusted, y_pred)
 
-        # Calculate accuracy and log loss
-        accuracy = accuracy_score(self.y_test, y_pred)
-        loss = log_loss(self.y_test, y_pred_proba)
+        # Calculate log loss
+        loss = log_loss(y_test_adjusted, y_pred_proba)
 
         return accuracy, loss
 
@@ -637,11 +637,24 @@ class ModelTraining:
         return accuracy, loss
 
     def SVC_model(self):
-        self.model = SVC()
+        # Initialize the SVC model with probability estimates enabled
+        self.model = SVC(probability=True)  # Enable probability estimates
+
+        # Fit the model to the training data
         self.model.fit(self.X_train, self.y_train)
+
+        # Predict class labels for the test set
         y_pred = self.model.predict(self.X_test)
+
+        # Calculate accuracy
         accuracy = accuracy_score(self.y_test, y_pred)
-        loss = log_loss(self.y_test, self.model.predict_proba(self.X_test))
+
+        # Predict probabilities for the test set
+        y_pred_proba = self.model.predict_proba(self.X_test)
+
+        # Calculate log loss
+        loss = log_loss(self.y_test, y_pred_proba)
+
         return accuracy, loss
 
     def GaussianNB_model(self):
@@ -674,9 +687,12 @@ if __name__ == '__main__':
     mt.preprocess_data()
 
     # Train the Dense model and get its history
-    trainHistory, accuracy, loss = mt.LSTMCNN_model()
+    # accuracy, loss = mt.SVC_model()
 
-    # Plot the training history
-    plot_training_history(trainHistory, "LSTMCNN")
+    # Train the Dense model and get its history
+    trainHistory, accuracy, loss = mt.Dense_model()
+    #
+    # # Plot the training history
+    plot_training_history(trainHistory, "DENSE")
 
     print(accuracy, loss)
