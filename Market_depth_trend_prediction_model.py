@@ -1,4 +1,5 @@
 import datetime
+import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.tree import DecisionTreeClassifier
 from sqlalchemy import create_engine
@@ -23,10 +24,44 @@ from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import LearningRateScheduler
 import os
+from tqdm import tqdm
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"  # Use GPUs 0 and 1
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPUs 0 and 1
 
-import matplotlib.pyplot as plt
+
+def calculate_future_price_optimized(df, minutes_ahead=5):
+    df['time'] = pd.to_datetime(df['time'])
+    temp_df = df.copy()
+    temp_df.set_index('time', inplace=True)
+
+    # Approximate progress with tqdm by iterating through the length of the DataFrame
+    for _ in tqdm(range(len(df)), desc="Processing..."):
+        pass  # This is just to show the progress bar and does not do any operation
+
+    # Continue with the resampling operation
+    resampled_df = temp_df.resample(f'{minutes_ahead}min').agg({'mid_price': 'mean'})
+    resampled_df['future_mid_price'] = resampled_df['mid_price'].shift(-minutes_ahead)
+    resampled_df.reset_index(inplace=True)
+    final_df = pd.merge_asof(df.sort_values('time'), resampled_df[['time', 'future_mid_price']].sort_values('time'),
+                             on='time', direction='forward')
+
+    return final_df
+
+
+def add_direction_based_on_future_price(df):
+    tqdm.pandas(desc="Calculating directions")  # Prepare tqdm to work with pandas
+
+    conditions = [
+        (df['future_mid_price'] > df['mid_price']),  # Condition for 1
+        (df['future_mid_price'] < df['mid_price']),  # Condition for -1
+    ]
+    choices = [1, -1]  # Corresponding choices for conditions
+
+    # Use np.select to apply conditions and choices, with tqdm to show progress
+    df['direction'] = np.select(conditions, choices, default=0)  # default is 0 if neither condition is met
+
+    df.dropna(inplace=True)
+    return df
 
 
 def plot_training_history(trainHistory, model_name):
@@ -52,33 +87,6 @@ def plot_training_history(trainHistory, model_name):
     plt.show()
 
 
-def compute_order_book_features(df, depth=5):
-    # Initialize empty DataFrame for features
-    features = pd.DataFrame(index=df.index)
-
-    # Calculate mid-price
-    features['mid_price'] = (df['bid_price_1'] + df['ask_price_1']) / 2
-
-    # Calculate order book imbalance for top 'depth' levels
-    total_bid_volume = df[[f'bid_volume_{i}' for i in range(1, depth + 1)]].sum(axis=1)
-    total_ask_volume = df[[f'ask_volume_{i}' for i in range(1, depth + 1)]].sum(axis=1)
-    features['book_imbalance'] = (total_bid_volume - total_ask_volume) / (total_bid_volume + total_ask_volume)
-
-    # Calculate VWAP distance from mid-price for bids and asks
-    bid_vwap = sum(df[f'bid_price_{i}'] * df[f'bid_volume_{i}'] for i in range(1, depth + 1)) / total_bid_volume
-    ask_vwap = sum(df[f'ask_price_{i}'] * df[f'ask_volume_{i}'] for i in range(1, depth + 1)) / total_ask_volume
-    features['bid_vwap_distance'] = features['mid_price'] - bid_vwap
-    features['ask_vwap_distance'] = ask_vwap - features['mid_price']
-
-    # Calculate mid-price movement (lagged to avoid look-ahead bias)
-    features['mid_price_movement'] = features['mid_price'].diff().shift(-1)
-
-    # Calculate order flow momentum (difference in bid and ask updates, lagged)
-    features['order_flow_momentum'] = (df['bid_updates'] - df['ask_updates']).diff().shift(-1)
-
-    return features.dropna()
-
-
 class ModelTraining:
     def __init__(self, database_path):
         self.X = None
@@ -93,8 +101,8 @@ class ModelTraining:
         elif os.path.splitext(database_path)[1] == ".db":
             engine = create_engine(f"sqlite:///NQ_ticks.db")
             self.df = pd.read_sql("SELECT * from NQ_market_depth", engine)
-        if "time" in self.df.columns:
-            self.df = self.df.drop("time", axis=1)
+        # if "time" in self.df.columns:
+        #     self.df = self.df.drop("time", axis=1)
         if "lastSize" in self.df.columns:
             self.df = self.df.drop("lastSize", axis=1)
         self.early_stop = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=20)
@@ -105,52 +113,132 @@ class ModelTraining:
         self.lr_schedule = LearningRateScheduler(lambda epoch: 0.001 * (0.1 ** (epoch // 10)))
         self.models = {}
 
-    def compute_order_book_features(self, depth=5):
-        features = pd.DataFrame(index=self.df.index)
+    def calculate_correlation_matrix(self, df):
+        correlation_matrix = df.corr()
+        return correlation_matrix
 
-        # Correcting the column names to include underscores
-        features['mid_price'] = (self.df['bidPrice_1'] + self.df['askPrice_1']) / 2
+    def plot_correlation_heatmap(self, correlation_matrix):
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(correlation_matrix, annot=True, fmt=".2f", cmap='coolwarm', linewidths=.5)
+        plt.title('Feature Correlation Heatmap')
+        plt.show()
 
-        # Calculating total bid and ask volumes at top 'depth' levels
-        total_bid_volume = self.df[[f'bidSize_{i}' for i in range(1, depth + 1)]].sum(axis=1)
-        total_ask_volume = self.df[[f'askSize_{i}' for i in range(1, depth + 1)]].sum(axis=1)
+    def identify_highly_correlated_features(self, correlation_matrix, threshold=0.9):
+        highly_correlated_pairs = {}
+        for col in correlation_matrix.columns:
+            for row in correlation_matrix.index:
+                if abs(correlation_matrix[col][row]) > threshold and col != row:
+                    highly_correlated_pairs[(col, row)] = correlation_matrix[col][row]
+        return highly_correlated_pairs
+
+    def filter_redundant_features(self, df, highly_correlated_pairs):
+        # Assuming you always remove the second feature in the tuple
+        features_to_remove = {pair[1] for pair in highly_correlated_pairs}
+        filtered_df = df.drop(columns=features_to_remove)
+        return filtered_df
+
+    def compute_order_book_features(self, df, depth=5):
+        # Calculate mid-price and add it to the DataFrame before other calculations
+        df['mid_price'] = (df['bidPrice_1'] + df['askPrice_1']) / 2
+
+        # Initialize empty DataFrame for features
+        features = pd.DataFrame(index=df.index)
+        features['time'] = df['time']
+
+        # Use the newly added 'mid_price' column for further feature calculations
+        features['mid_price'] = df['mid_price']
+        features['spread'] = df['askPrice_1'] - df['bidPrice_1']  # Calculate book imbalance for top 'depth' levels
+        total_bid_volume = df[[f'bidSize_{i}' for i in range(1, depth + 1)]].sum(axis=1)
+        total_ask_volume = df[[f'askSize_{i}' for i in range(1, depth + 1)]].sum(axis=1)
         features['book_imbalance'] = (total_bid_volume - total_ask_volume) / (total_bid_volume + total_ask_volume)
 
-        # VWAP distance calculations
-        bid_vwap = sum(
-            self.df[f'bidPrice_{i}'] * self.df[f'bidSize_{i}'] for i in range(1, depth + 1)) / total_bid_volume
-        ask_vwap = sum(
-            self.df[f'askPrice_{i}'] * self.df[f'askSize_{i}'] for i in range(1, depth + 1)) / total_ask_volume
+        # Calculate VWAP distance from mid-price for bids and asks
+        bid_vwap = sum(df[f'bidPrice_{i}'] * df[f'bidSize_{i}'] for i in range(1, depth + 1)) / total_bid_volume
+        ask_vwap = sum(df[f'askPrice_{i}'] * df[f'askSize_{i}'] for i in range(1, depth + 1)) / total_ask_volume
         features['bid_vwap_distance'] = features['mid_price'] - bid_vwap
         features['ask_vwap_distance'] = ask_vwap - features['mid_price']
+
+        # Price and volume trends over recent ticks
+        for window in [1, 5, 10]:  # Example windows: last 1, 5, and 10 ticks
+            df_rolled = df[['bidPrice_1', 'askPrice_1', 'bidSize_1', 'askSize_1']].rolling(window=window)
+            features[f'bidPrice_trend_{window}'] = df_rolled['bidPrice_1'].mean()
+            features[f'askPrice_trend_{window}'] = df_rolled['askPrice_1'].mean()
+            features[f'bidSize_trend_{window}'] = df_rolled['bidSize_1'].mean()
+            features[f'askSize_trend_{window}'] = df_rolled['askSize_1'].mean()
+
+        # Historical volatility (using mid-price)
+        features['historical_volatility'] = features['mid_price'].diff().rolling(window=10).std()
+
+        # Time of day and market session
+        features['time_of_day'] = df['time'].dt.hour + df['time'].dt.minute / 60 + df['time'].dt.second / 3600
+        features['day_of_week'] = df['time'].dt.dayofweek
 
         # Calculate mid-price movement (lagged to avoid look-ahead bias)
         features['mid_price_movement'] = features['mid_price'].diff().shift(-1)
 
         # Calculate order flow momentum (difference in bid and ask updates, lagged)
-        # features['order_flow_momentum'] = (self.df['bid_updates'] - self.df['ask_updates']).diff().shift(-1)
+        features['order_flow_momentum'] = (df['bidSize_1'] - df['askSize_1']).diff().shift(-1)
+
+        # Moving Averages
+        for window in [5, 10, 20]:  # Example windows
+            features[f'sma_{window}'] = features['mid_price'].rolling(window=window).mean()
+            features[f'ema_{window}'] = features['mid_price'].ewm(span=window, adjust=False).mean()
+
+        # Drop NaN values created by rolling functions
+        features = features.dropna()
+
         return features
 
-    def preprocess_data(self):
+    def preprocess_data(self, minutes_ahead=5):
+        # Ensure 'time' is in datetime format
+        self.df['time'] = pd.to_datetime(self.df['time'], format='%Y-%m-%d %H:%M:%S.%f', errors='coerce')
+        self.df.loc[self.df['time'].isna(), 'time'] = pd.to_datetime(self.df.loc[self.df['time'].isna(), 'time'],
+                                                                     format='%Y-%m-%d %H:%M:%S', errors='coerce')
+        self.df.dropna(subset=['time'], inplace=True)
+
         # Compute custom features based on order book data
-        features = self.compute_order_book_features()
+        features_df = self.compute_order_book_features(self.df)
 
-        # Ensure 'features' DataFrame includes 'mid_price'
-        assert 'mid_price' in features.columns, "mid_price column not found in features DataFrame"
+        self.df.sort_values(by='time', inplace=True)
 
-        # Integrate 'features' back into 'self.df'
-        self.df = self.df.join(features)  # Using join to add features to self.df
+        self.df = calculate_future_price_optimized(self.df, minutes_ahead)
 
-        # Ensure 'mid_price' is now part of 'self.df'
-        assert 'mid_price' in self.df.columns, "mid_price column not integrated into self.df"
+        # Make sure both DataFrames are sorted by time
+        self.df.sort_values(by='time', inplace=True)
+        features_df.sort_values(by='time', inplace=True)
 
-        # Proceed with using 'mid_price'
-        self.df['future_mid_price'] = self.df['mid_price'].shift(-1)  # Predicting next tick's mid-price
-        self.df['direction'] = (self.df['future_mid_price'] > self.df['mid_price']).astype(int)
-        self.df.dropna(inplace=True)
+        # Rename 'mid_price' in features_df to 'price_y' before merging
+        features_df.rename(columns={'mid_price': 'price_y'}, inplace=True)
 
-        self.X = self.df[features.columns].values  # Use only the columns from features for X
-        self.y = self.df['direction'].values
+        # Calculate correlation matrix
+        correlation_matrix = features_df.corr()
+
+        # Plot heatmap
+        self.plot_correlation_heatmap(correlation_matrix)
+
+        # Identify highly correlated features
+        highly_correlated_pairs = self.identify_highly_correlated_features(correlation_matrix)
+
+        # Filter redundant features
+        features_df_filtered = self.filter_redundant_features(features_df, highly_correlated_pairs)
+
+        # Use merge_asof to merge the features back into the main DataFrame based on the 'time' column
+        merged_df = pd.merge_asof(self.df.sort_values('time'), features_df_filtered.sort_values('time'), on='time',
+                                  direction='nearest')
+
+        # Use np.select to apply conditions and choices
+        merged_df = add_direction_based_on_future_price(merged_df)
+        merged_df.dropna(inplace=True)
+
+        csv_filename = "preprocessed_data.csv"  # Define the name of your CSV file
+        merged_df.to_csv(csv_filename, index=False)  # Save the DataFrame to a CSV file without the index
+        print(f"Preprocessed data saved to {csv_filename}")
+
+        # Select only the numerical columns (excluding 'time')
+        numerical_columns = [col for col in self.df.columns if col != 'time']
+
+        self.X = merged_df[numerical_columns].values
+        self.y = merged_df['direction'].values
 
         # Splitting the dataset into training and testing sets, normalizing the feature set
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=0.3,
@@ -181,15 +269,15 @@ class ModelTraining:
         }
 
     def Dense_model(self):
-        self.y_train = to_categorical(self.y_train, num_classes=2)
-        self.y_test = to_categorical(self.y_test, num_classes=2)
+        self.y_train = to_categorical(self.y_train, num_classes=3)
+        self.y_test = to_categorical(self.y_test, num_classes=3)
 
         input_layer = Input(shape=(self.X_train.shape[1],))
         x = Dense(128, activation='relu')(input_layer)
         x = Dropout(0.5)(x)
         x = Dense(64, activation='relu')(x)
         x = Dropout(0.5)(x)
-        output_layer = Dense(2, activation='softmax')(x)
+        output_layer = Dense(3, activation='softmax')(x)
 
         model = Model(inputs=input_layer, outputs=output_layer)
         model.compile(loss='categorical_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
@@ -581,22 +669,14 @@ class ModelTraining:
         return accuracy, loss
 
 
-def huber_loss(y_true, y_pred):
-    error = tf.cast(tf.argmax(y_true) - tf.argmax(y_pred), tf.float32)
-    is_small_error = tf.abs(error) < 1
-    squared_loss = tf.square(error) / 2
-    linear_loss = tf.abs(error) - 1
-    return tf.where(is_small_error, squared_loss, linear_loss)
-
-
 if __name__ == '__main__':
-    mt = ModelTraining(database_path="NQ_ticks.db")
+    mt = ModelTraining(database_path='MarketDepth_data_sample.csv')
     mt.preprocess_data()
 
     # Train the Dense model and get its history
-    trainHistory, accuracy, loss = mt.Dense_model()
+    trainHistory, accuracy, loss = mt.LSTMCNN_model()
 
     # Plot the training history
-    plot_training_history(trainHistory, "Dense")
+    plot_training_history(trainHistory, "LSTMCNN")
 
     print(accuracy, loss)
