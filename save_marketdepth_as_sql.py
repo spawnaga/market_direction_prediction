@@ -5,7 +5,7 @@ from ib_insync import *
 import random
 import time
 import datetime
-
+util.startLoop()
 
 class StreamData:
     def __init__(self, db_path="./ES_ticks.db"):
@@ -14,16 +14,16 @@ class StreamData:
         column_names += ['lastPrice', 'lastSize', 'time']
         self.df_x = pd.DataFrame(index=range(1), columns=column_names)
         self.ib = IB()
-        self.ib.connect('127.0.0.1', 7496, random.randint(0, 100))
+        self.ib.connect('172.30.192.1', 7497, random.randint(0, 100), timeout=20)
         self.contract = ContFuture(symbol="ES", exchange="CME", currency="USD")
         self.ib.qualifyContracts(self.contract)
-        self.ticker = self.ib.reqMktDepth(self.contract)
+        self.ticker = self.ib.reqMktDepth(self.contract, numRows=10)
         self.db_file = db_path
         self.db = sqlite3.connect(self.db_file)
         self.cursor = self.db.cursor()
         self.ib.errorEvent += self.errorAndReconnect  # subscribe to error event
 
-    def errorAndReconnect(self, reqId=None, errorCode=None, errorString=None):
+    def errorAndReconnect(self, reqId=None, errorCode=None, errorString=None, aContract=None):
         print(f"Error: {errorCode}, {errorString}")
         # handle the error here as appropriate for your use case
         while not self.ib.isConnected() or not self.ib.client.isConnected():
@@ -31,7 +31,7 @@ class StreamData:
                 self.ib.connect('127.0.0.1', 7496, random.randint(0, 100))
                 self.contract = ContFuture(symbol="ES", exchange="CME", currency="USD")
                 self.ib.qualifyContracts(self.contract)
-                self.ticker = self.ib.reqMktDepth(self.contract)
+                self.ticker = self.ib.reqMktDepth(self.contract, numRows=10)
                 print("Connected to Interactive Brokers TWS")
             except Exception as e:
                 print(f"Error: {e}. Retrying in 10 seconds...")

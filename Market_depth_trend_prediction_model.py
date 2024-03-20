@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 import tensorflow as tf
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, log_loss, mean_squared_error
 from sklearn.linear_model import LinearRegression, LogisticRegression, Perceptron
 from sklearn.neighbors import KNeighborsClassifier
@@ -18,11 +18,13 @@ from sklearn.svm import SVC
 from sklearn import tree
 from xgboost import XGBClassifier
 from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.layers import Input, Conv1D, Flatten, Dense, Dropout, MaxPool1D, LSTM, RNN, SimpleRNN, Reshape
+from tensorflow.keras.layers import Input, Conv1D, Flatten, Dense, Dropout, MaxPool1D, LSTM, RNN, SimpleRNN, Reshape,BatchNormalization
 from tensorflow.keras.models import Model
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import LearningRateScheduler
+from tensorflow.keras.optimizers import Nadam
+from tensorflow.keras.regularizers import l2
 import os
 from tqdm import tqdm
 
@@ -99,14 +101,14 @@ class ModelTraining:
         if os.path.splitext(database_path)[1] == ".csv":
             self.df = pd.read_csv(database_path)
         elif os.path.splitext(database_path)[1] == ".db":
-            engine = create_engine(f"sqlite:///NQ_ticks.db")
-            self.df = pd.read_sql("SELECT * from NQ_market_depth", engine)
+            engine = create_engine(f"sqlite:///ES_ticks.db")
+            self.df = pd.read_sql("SELECT * from ES_market_depth", engine)
         # if "time" in self.df.columns:
         #     self.df = self.df.drop("time", axis=1)
         if "lastSize" in self.df.columns:
             self.df = self.df.drop("lastSize", axis=1)
         self.early_stop = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=20)
-        self.scaler = MinMaxScaler()
+        self.scaler = StandardScaler()
         self.logdir = "logs/fit/" + "agentLearning" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=self.logdir)
         self.optimizer = Adam(learning_rate=0.01)
@@ -248,6 +250,9 @@ class ModelTraining:
         self.scaler.fit(self.X_train)
         self.X_train = self.scaler.transform(self.X_train)
         self.X_test = self.scaler.transform(self.X_test)
+        # Adjust y values for binary classification: map -1 to 0, keep 1 as is
+        self.y_train = np.where(self.y_train == -1, 0, self.y_train)
+        self.y_test = np.where(self.y_test == -1, 0, self.y_test)
 
     def create_models(self):
         self.models = {
@@ -271,15 +276,17 @@ class ModelTraining:
         }
 
     def Dense_model(self):
-        self.y_train = to_categorical(self.y_train, num_classes=3)
-        self.y_test = to_categorical(self.y_test, num_classes=3)
+        # self.y_train = to_categorical(self.y_train, num_classes=1)
+        # self.y_test = to_categorical(self.y_test, num_classes=1)
 
         input_layer = Input(shape=(self.X_train.shape[1],))
-        x = Dense(128, activation='relu')(input_layer)
-        x = Dropout(0.5)(x)
-        x = Dense(64, activation='relu')(x)
-        x = Dropout(0.5)(x)
-        output_layer = Dense(3, activation='softmax')(x)
+        x = Dense(100, activation='relu', kernel_regularizer='l2')(input_layer)
+        x = Dropout(0.7)(x)
+        x = Dense(50, activation='relu', kernel_regularizer='l2')(x)
+        x = Dropout(0.7)(x)
+        x = Dense(25, activation='relu', kernel_regularizer='l2')(x)
+        x = Dropout(0.7)(x)
+        output_layer = Dense(1, activation='sigmoid', kernel_regularizer='l2')(x)
 
         model = Model(inputs=input_layer, outputs=output_layer)
         model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
@@ -298,7 +305,7 @@ class ModelTraining:
         trainHistory = model.fit(
             self.X_train, self.y_train, epochs=100, batch_size=64,
             validation_data=(self.X_test, self.y_test),
-            callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Add early_stop to callbacks
+            callbacks=[self.tensorboard_callback, self.lr_schedule]  # Add early_stop to callbacks
         )
 
         return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
@@ -309,9 +316,9 @@ class ModelTraining:
         X_test_reshaped = np.expand_dims(self.X_test, axis=-1)  # Same for X_test
 
         # Ensure y_train and y_test are one-hot encoded
-        num_classes = 3  # Adjust based on your actual number of classes
-        y_train_encoded = to_categorical(self.y_train, num_classes=num_classes)
-        y_test_encoded = to_categorical(self.y_test, num_classes=num_classes)
+        # num_classes = 2  # Adjust based on your actual number of classes
+        # y_train_encoded = to_categorical(self.y_train, num_classes=num_classes)
+        # y_test_encoded = to_categorical(self.y_test, num_classes=num_classes)
 
         # Define the CNN model
         input_layer = Input(shape=(X_train_reshaped.shape[1], 1))  # Adjusted shape
@@ -325,7 +332,7 @@ class ModelTraining:
         x = Dropout(0.5)(x)
         x = Dense(64, activation='relu')(x)
         x = Dropout(0.5)(x)
-        output = Dense(num_classes, activation='softmax')(x)  # Adjusted output layer to match num_classes
+        output = Dense(1, activation='sigmoid')(x)  # Adjusted output layer to match num_classes
         model = Model(inputs=input_layer, outputs=output)
 
         # Compile the model
@@ -343,8 +350,8 @@ class ModelTraining:
 
         # Train the model with early stopping
         trainHistory = model.fit(
-            X_train_reshaped, y_train_encoded, epochs=100,  # Adjusted epochs
-            batch_size=500, validation_data=(X_test_reshaped, y_test_encoded),
+            X_train_reshaped, self.y_train, epochs=100,  # Adjusted epochs
+            batch_size=500, validation_data=(X_test_reshaped, self.y_test),
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Use early_stop in callbacks
         )
 
@@ -354,20 +361,24 @@ class ModelTraining:
 
         strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
         with strategy.scope():
-            self.y_train = to_categorical(self.y_train, num_classes=3)
-            self.y_test = to_categorical(self.y_test, num_classes=3)
+            # self.y_train = to_categorical(self.y_train, num_classes=3)
+            # self.y_test = to_categorical(self.y_test, num_classes=3)
 
             input_layer = Input(shape=(self.X_train.shape[1], 1))  # Adjusted for reshaped X_train
-            x = LSTM(units=32, return_sequences=True)(input_layer)
-            x = Dropout(0.5)(x)
+            x = LSTM(units=64, return_sequences=True)(input_layer)
+            x = Dropout(0.8)(x)
             x = LSTM(units=64, return_sequences=True)(x)
-            x = Dropout(0.5)(x)
+            x = Dropout(0.8)(x)
+            x = LSTM(units=64, return_sequences=True)(x)
+            x = Dropout(0.8)(x)
+            x = LSTM(units=64, return_sequences=True)(x)
+            x = Dropout(0.8)(x)
             x = LSTM(units=32, return_sequences=False)(x)  # Last LSTM layer usually does not return sequences
-            x = Dropout(0.5)(x)
-            output_layer = Dense(3, activation='softmax')(x)  # Use softmax for multi-class classification
+            x = Dropout(0.8)(x)
+            output = Dense(1, activation='sigmoid')(x)  # Use softmax for multi-class classification
 
-            model = Model(inputs=input_layer, outputs=output_layer)
-            model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+            model = Model(inputs=input_layer, outputs=output)
+            model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
 
         # Configure the EarlyStopping callback to monitor validation accuracy
         early_stop = EarlyStopping(
@@ -403,11 +414,9 @@ class ModelTraining:
         x = Dropout(0.5)(x)
         x = SimpleRNN(units=64, return_sequences=False)(x)  # Last RNN layer usually does not return sequences
         x = Dropout(0.5)(x)
-        output = Dense(3, activation='softmax')(x)  # Assuming 3 classes for the output layer
+        output = Dense(2, activation='sigmoid')(x)  # Assuming 3 classes for the output layer
         model = Model(inputs=input_layer, outputs=output)
-
-        # Compile the model
-        model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+        model.compile(loss='binary_crossentropy', optimizer='nadam', metrics=['accuracy'])
 
         # Configure the EarlyStopping callback to monitor validation accuracy
         early_stop = EarlyStopping(
@@ -451,17 +460,15 @@ class ModelTraining:
         x = Dropout(0.5)(x)
         x = Reshape((-1, 64))(x)  # Adjusted reshape to match RNN input requirements
         x = SimpleRNN(units=64, activation='relu')(x)
-        output = Dense(3, activation='softmax')(x)  # Using softmax for a classification task
+        output = Dense(2, activation='sigmoid')(x)  # Using softmax for a classification task
         model = Model(inputs=input_layer, outputs=output)
-
-        # Compile the model
-        model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+        model.compile(loss='binary_crossentropy', optimizer='nadam', metrics=['accuracy'])
 
         # Configure the EarlyStopping callback
         early_stop = EarlyStopping(
             monitor='val_accuracy',
             min_delta=0.001,
-            patience=10,
+            patience=20,
             verbose=1,
             mode='max',
             restore_best_weights=True
@@ -477,53 +484,33 @@ class ModelTraining:
         return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
 
     def LSTMCNN_model(self):
-        # Ensure target variables are one-hot encoded
-        y_train_encoded = to_categorical(self.y_train, num_classes=3)
-        y_test_encoded = to_categorical(self.y_test, num_classes=3)
-
-        # Reshape input data to be 3D for LSTM layers
+        # Reshape input data for LSTM layers
         X_train_reshaped = np.expand_dims(self.X_train, axis=-1)
         X_test_reshaped = np.expand_dims(self.X_test, axis=-1)
 
-        # Define the LSTM-CNN model
         input_layer = Input(shape=(X_train_reshaped.shape[1], 1))
         x = LSTM(64, return_sequences=True)(input_layer)
-        x = Conv1D(filters=32, kernel_size=3, padding='same', activation='relu')(x)
+        x = Dropout(0.5)(x)
+        x = BatchNormalization()(x)
+        x = Conv1D(filters=32, kernel_size=3, activation='relu')(x)
+        x = Dropout(0.5)(x)
         x = MaxPool1D(pool_size=2)(x)
-        x = Conv1D(filters=64, kernel_size=3, padding='same', activation='relu')(x)
-        x = MaxPool1D(pool_size=2)(x)
-        x = Conv1D(filters=128, kernel_size=3, padding='same', activation='relu')(x)
-        x = Flatten()(x)
-        x = Dense(128, activation='relu')(x)
+        x = LSTM(64, return_sequences=False)(x)
         x = Dropout(0.5)(x)
         x = Dense(64, activation='relu')(x)
         x = Dropout(0.5)(x)
-        x = Reshape((-1, 64))(x)  # Adjusted reshape to match RNN input requirements
-        x = SimpleRNN(units=64, activation='relu')(x)
-        output = Dense(3, activation='softmax')(x)  # Using softmax for a classification task
+        output = Dense(1, activation='sigmoid')(x)  # Assuming binary classification for buy/sell decision
+
         model = Model(inputs=input_layer, outputs=output)
+        model.compile(loss='binary_crossentropy', optimizer='nadam', metrics=['accuracy'])
 
-        # Compile the model
-        model.compile(loss='binary_crossentropy', optimizer=self.optimizer, metrics=['accuracy'])
+        early_stop = EarlyStopping(monitor='val_loss', patience=10, verbose=1, mode='min', restore_best_weights=True)
 
-        # Configure the EarlyStopping callback
-        early_stop = EarlyStopping(
-            monitor='val_accuracy',
-            min_delta=0.001,
-            patience=10,
-            verbose=1,
-            mode='max',
-            restore_best_weights=True
-        )
-
-        # Train the model with early stopping
-        trainHistory = model.fit(
-            X_train_reshaped, y_train_encoded, epochs=100,  # A reasonable number of epochs
-            batch_size=500, validation_data=(X_test_reshaped, y_test_encoded),
-            callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Include early_stop in callbacks
-        )
+        trainHistory = model.fit(X_train_reshaped, self.y_train, epochs=100, batch_size=64,
+                                 validation_data=(X_test_reshaped, self.y_test), callbacks=[self.tensorboard_callback, self.lr_schedule])
 
         return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
+
 
     def check_and_convert_target_variable(self):
         # Check if the target variable contains more than two unique values
@@ -683,16 +670,16 @@ class ModelTraining:
 
 
 if __name__ == '__main__':
-    mt = ModelTraining(database_path='MarketDepth_data_sample.csv')
+    mt = ModelTraining(database_path='ES_ticks.db')
     mt.preprocess_data()
 
     # Train the Dense model and get its history
     # accuracy, loss = mt.SVC_model()
 
     # Train the Dense model and get its history
-    trainHistory, accuracy, loss = mt.Dense_model()
+    trainHistory, accuracy, loss = mt.LSTMCNN_model()
     #
     # # Plot the training history
-    plot_training_history(trainHistory, "DENSE")
+    plot_training_history(trainHistory, "LSTMCNN")
 
     print(accuracy, loss)
