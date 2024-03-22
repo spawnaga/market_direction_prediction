@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 import tensorflow as tf
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
 from sklearn.metrics import accuracy_score, log_loss, mean_squared_error
 from sklearn.linear_model import LinearRegression, LogisticRegression, Perceptron
 from sklearn.neighbors import KNeighborsClassifier
@@ -36,10 +36,6 @@ def calculate_future_price_optimized(df, minutes_ahead=5):
     temp_df = df.copy()
     temp_df.set_index('time', inplace=True)
 
-    # Approximate progress with tqdm by iterating through the length of the DataFrame
-    for _ in tqdm(range(len(df)), desc="Processing..."):
-        pass  # This is just to show the progress bar and does not do any operation
-
     # Continue with the resampling operation
     resampled_df = temp_df.resample(f'{minutes_ahead}min').agg({'mid_price': 'mean'})
     resampled_df['future_mid_price'] = resampled_df['mid_price'].shift(-minutes_ahead)
@@ -55,9 +51,9 @@ def add_direction_based_on_future_price(df):
 
     conditions = [
         (df['future_mid_price'] > df['mid_price']),  # Condition for 1
-        (df['future_mid_price'] < df['mid_price']),  # Condition for -1
+        (df['future_mid_price'] < df['mid_price']),  # Condition for 0
     ]
-    choices = [1, -1]  # Corresponding choices for conditions
+    choices = [1, 0]  # Corresponding choices for conditions
 
     # Use np.select to apply conditions and choices, with tqdm to show progress
     df['direction'] = np.select(conditions, choices, default=0)  # default is 0 if neither condition is met
@@ -105,13 +101,13 @@ class ModelTraining:
             self.df = pd.read_sql("SELECT * from ES_market_depth", engine)
         # if "time" in self.df.columns:
         #     self.df = self.df.drop("time", axis=1)
-        if "lastSize" in self.df.columns:
-            self.df = self.df.drop("lastSize", axis=1)
+        # if "lastSize" in self.df.columns:
+        #     self.df = self.df.drop("lastSize", axis=1)
         self.early_stop = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=20)
         self.scaler = StandardScaler()
         self.logdir = "logs/fit/" + "agentLearning" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=self.logdir)
-        self.optimizer = Adam(learning_rate=0.01)
+        self.optimizer = Nadam(learning_rate=0.01)
         self.lr_schedule = LearningRateScheduler(lambda epoch: 0.001 * (0.1 ** (epoch // 10)))
         self.models = {}
 
@@ -191,12 +187,33 @@ class ModelTraining:
 
         return features
 
+    def handle_zeros_in_data(self, df):
+        # Function to replace zeros with the nearest non-zero values in the same column
+        for col in df.columns:
+            if 'Price' in col or 'Size' in col:  # Only apply to Price and Size columns
+                # Replace 0 with NaN to use fillna with method='ffill'/'bfill'
+                df[col] = df[col].replace(0, np.nan)
+
+                # Forward fill to replace NaN with the nearest non-zero value ahead in the column
+                df[col] = df[col].ffill()
+
+                # Backward fill to replace any remaining NaNs with the nearest non-zero value behind in the column
+                df[col] = df[col].bfill()
+
+                # If there are still any NaNs left, replace them with 0 (should only happen if a column is all zeros)
+                df[col] = df[col].fillna(0)
+
+        return df
+
     def preprocess_data(self, minutes_ahead=5):
         # Ensure 'time' is in datetime format
         self.df['time'] = pd.to_datetime(self.df['time'], format='%Y-%m-%d %H:%M:%S.%f', errors='coerce')
         self.df.loc[self.df['time'].isna(), 'time'] = pd.to_datetime(self.df.loc[self.df['time'].isna(), 'time'],
                                                                      format='%Y-%m-%d %H:%M:%S', errors='coerce')
         self.df.dropna(subset=['time'], inplace=True)
+
+        # Handle zeros in bid and ask prices and volumes
+        self.df = self.handle_zeros_in_data(self.df)
 
         # Compute custom features based on order book data
         features_df = self.compute_order_book_features(self.df)
@@ -254,6 +271,18 @@ class ModelTraining:
         self.y_train = np.where(self.y_train == -1, 0, self.y_train)
         self.y_test = np.where(self.y_test == -1, 0, self.y_test)
 
+        unique, counts = np.unique(self.y_train, return_counts=True)
+        count_dict = dict(zip(unique, counts))
+
+        # Ensure that both 0 and 1 are present in the array
+        if 0 in count_dict and 1 in count_dict:
+            ratio_of_1s = count_dict[1] / (count_dict[0] + count_dict[1])
+            ratio_of_0s = count_dict[0] / (count_dict[0] + count_dict[1])
+            print(f"Ratio of 1s in training: {ratio_of_1s}")
+            print(f"Ratio of 0s in training: {ratio_of_0s}")
+        else:
+            print("One of the classes is missing in the training data.")
+
     def create_models(self):
         self.models = {
             "Dense": self.Dense_model,
@@ -280,12 +309,12 @@ class ModelTraining:
         # self.y_test = to_categorical(self.y_test, num_classes=1)
 
         input_layer = Input(shape=(self.X_train.shape[1],))
-        x = Dense(100, activation='relu', kernel_regularizer='l2')(input_layer)
-        x = Dropout(0.7)(x)
-        x = Dense(50, activation='relu', kernel_regularizer='l2')(x)
-        x = Dropout(0.7)(x)
-        x = Dense(25, activation='relu', kernel_regularizer='l2')(x)
-        x = Dropout(0.7)(x)
+        x = Dense(86, activation='relu', kernel_regularizer='l2')(input_layer)
+        x = Dropout(0.3)(x)
+        x = Dense(43, activation='relu', kernel_regularizer='l2')(x)
+        x = Dropout(0.3)(x)
+        x = Dense(21, activation='relu', kernel_regularizer='l2')(x)
+        x = Dropout(0.3)(x)
         output_layer = Dense(1, activation='sigmoid', kernel_regularizer='l2')(x)
 
         model = Model(inputs=input_layer, outputs=output_layer)
@@ -295,7 +324,7 @@ class ModelTraining:
         early_stop = EarlyStopping(
             monitor='val_accuracy',  # Monitor validation accuracy
             min_delta=0.001,  # Minimum change to qualify as an improvement
-            patience=10,  # Number of epochs with no improvement after which training will be stopped
+            patience=50,  # Number of epochs with no improvement after which training will be stopped
             verbose=1,
             mode='max',  # Since we are monitoring accuracy, which should increase
             restore_best_weights=True
@@ -303,9 +332,9 @@ class ModelTraining:
         )
 
         trainHistory = model.fit(
-            self.X_train, self.y_train, epochs=100, batch_size=64,
+            self.X_train, self.y_train, epochs=100, batch_size=64000,
             validation_data=(self.X_test, self.y_test),
-            callbacks=[self.tensorboard_callback, self.lr_schedule]  # Add early_stop to callbacks
+            callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Add early_stop to callbacks
         )
 
         return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
@@ -316,7 +345,7 @@ class ModelTraining:
         X_test_reshaped = np.expand_dims(self.X_test, axis=-1)  # Same for X_test
 
         # Ensure y_train and y_test are one-hot encoded
-        # num_classes = 2  # Adjust based on your actual number of classes
+        # num_classes = 3  # Adjust based on your actual number of classes
         # y_train_encoded = to_categorical(self.y_train, num_classes=num_classes)
         # y_test_encoded = to_categorical(self.y_test, num_classes=num_classes)
 
@@ -341,7 +370,7 @@ class ModelTraining:
         # Configure the EarlyStopping callback to monitor validation accuracy
         early_stop = EarlyStopping(
             monitor='val_accuracy',
-            min_delta=0.001,
+            min_delta=0.05,
             patience=30,
             verbose=1,
             mode='max',
@@ -351,7 +380,7 @@ class ModelTraining:
         # Train the model with early stopping
         trainHistory = model.fit(
             X_train_reshaped, self.y_train, epochs=100,  # Adjusted epochs
-            batch_size=500, validation_data=(X_test_reshaped, self.y_test),
+            batch_size=32000, validation_data=(X_test_reshaped, self.y_test),
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Use early_stop in callbacks
         )
 
@@ -359,12 +388,16 @@ class ModelTraining:
 
     def LSTM_model(self):
 
+        # Reshape input data for LSTM layers
+        X_train_reshaped = np.expand_dims(self.X_train, axis=-1)
+        X_test_reshaped = np.expand_dims(self.X_test, axis=-1)
+
         strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
         with strategy.scope():
             # self.y_train = to_categorical(self.y_train, num_classes=3)
             # self.y_test = to_categorical(self.y_test, num_classes=3)
 
-            input_layer = Input(shape=(self.X_train.shape[1], 1))  # Adjusted for reshaped X_train
+            input_layer = Input(shape=(X_train_reshaped.shape[1], 1))  # Adjusted for reshaped X_train
             x = LSTM(units=64, return_sequences=True)(input_layer)
             x = Dropout(0.8)(x)
             x = LSTM(units=64, return_sequences=True)(x)
@@ -378,7 +411,7 @@ class ModelTraining:
             output = Dense(1, activation='sigmoid')(x)  # Use softmax for multi-class classification
 
             model = Model(inputs=input_layer, outputs=output)
-            model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+            model.compile(loss='binary_crossentropy', optimizer='nadam', metrics=['accuracy'])
 
         # Configure the EarlyStopping callback to monitor validation accuracy
         early_stop = EarlyStopping(
@@ -392,8 +425,8 @@ class ModelTraining:
 
         trainHistory = model.fit(
             self.X_train, self.y_train, epochs=100,  # Reduced epochs for demonstration
-            batch_size=64,  # Adjusted batch size
-            validation_data=(self.X_test, self.y_test),
+            batch_size=32000,  # Adjusted batch size
+            validation_data=(X_test_reshaped, self.y_test),
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]
         )
 
@@ -404,9 +437,9 @@ class ModelTraining:
         X_train_reshaped = np.expand_dims(self.X_train, axis=-1)  # Adding a dimension for 'features'
         X_test_reshaped = np.expand_dims(self.X_test, axis=-1)
 
-        # One-hot encode the target variables
-        y_train_encoded = to_categorical(self.y_train, num_classes=3)
-        y_test_encoded = to_categorical(self.y_test, num_classes=3)
+        # # One-hot encode the target variables
+        # y_train_encoded = to_categorical(self.y_train, num_classes=3)
+        # y_test_encoded = to_categorical(self.y_test, num_classes=3)
 
         # Define the RNN model
         input_layer = Input(shape=(X_train_reshaped.shape[1], 1))
@@ -414,7 +447,7 @@ class ModelTraining:
         x = Dropout(0.5)(x)
         x = SimpleRNN(units=64, return_sequences=False)(x)  # Last RNN layer usually does not return sequences
         x = Dropout(0.5)(x)
-        output = Dense(2, activation='sigmoid')(x)  # Assuming 3 classes for the output layer
+        output = Dense(1, activation='sigmoid')(x)  # Assuming 3 classes for the output layer
         model = Model(inputs=input_layer, outputs=output)
         model.compile(loss='binary_crossentropy', optimizer='nadam', metrics=['accuracy'])
 
@@ -430,8 +463,8 @@ class ModelTraining:
 
         # Train the model with early stopping
         trainHistory = model.fit(
-            X_train_reshaped, y_train_encoded, epochs=100,  # A more reasonable number of epochs
-            batch_size=500, validation_data=(X_test_reshaped, y_test_encoded),
+            X_train_reshaped, self.y_train, epochs=100,  # A more reasonable number of epochs
+            batch_size=32000, validation_data=(X_test_reshaped, self.y_test),
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Use early_stop in callbacks
         )
 
@@ -439,8 +472,8 @@ class ModelTraining:
 
     def CNNRNN_model(self):
         # Ensure target variables are one-hot encoded
-        y_train_encoded = to_categorical(self.y_train, num_classes=3)
-        y_test_encoded = to_categorical(self.y_test, num_classes=3)
+        # y_train_encoded = to_categorical(self.y_train, num_classes=3)
+        # y_test_encoded = to_categorical(self.y_test, num_classes=3)
 
         # Reshape input data to be 3D for Conv1D layers
         X_train_reshaped = np.expand_dims(self.X_train, axis=-1)
@@ -460,7 +493,7 @@ class ModelTraining:
         x = Dropout(0.5)(x)
         x = Reshape((-1, 64))(x)  # Adjusted reshape to match RNN input requirements
         x = SimpleRNN(units=64, activation='relu')(x)
-        output = Dense(2, activation='sigmoid')(x)  # Using softmax for a classification task
+        output = Dense(1, activation='sigmoid')(x)  # Using softmax for a classification task
         model = Model(inputs=input_layer, outputs=output)
         model.compile(loss='binary_crossentropy', optimizer='nadam', metrics=['accuracy'])
 
@@ -476,8 +509,8 @@ class ModelTraining:
 
         # Train the model with early stopping
         trainHistory = model.fit(
-            X_train_reshaped, y_train_encoded, epochs=100,  # A reasonable number of epochs
-            batch_size=500, validation_data=(X_test_reshaped, y_test_encoded),
+            X_train_reshaped, self.y_train, epochs=100,  # A reasonable number of epochs
+            batch_size=32000, validation_data=(X_test_reshaped, self.X_test),
             callbacks=[early_stop, self.tensorboard_callback, self.lr_schedule]  # Include early_stop in callbacks
         )
 
@@ -489,25 +522,42 @@ class ModelTraining:
         X_test_reshaped = np.expand_dims(self.X_test, axis=-1)
 
         input_layer = Input(shape=(X_train_reshaped.shape[1], 1))
-        x = LSTM(64, return_sequences=True)(input_layer)
-        x = Dropout(0.5)(x)
+
+        # First LSTM layer with more units
+        x = LSTM(128, return_sequences=True)(input_layer)
+        x = Dropout(0.2)(x)  # Slightly reduced dropout
+
+        # Batch normalization to stabilize learning
         x = BatchNormalization()(x)
-        x = Conv1D(filters=32, kernel_size=3, activation='relu')(x)
-        x = Dropout(0.5)(x)
+
+        # First Conv1D layer
+        x = Conv1D(filters=64, kernel_size=5, activation='relu')(x)  # Increased filters and kernel size
+        x = MaxPool1D(pool_size=2)(x)  # Pooling to reduce dimensionality
+
+        # Second Conv1D layer for deeper feature extraction
+        x = Conv1D(filters=128, kernel_size=3, activation='relu')(x)
+        x = Dropout(0.2)(x)  # Consistent dropout rate
         x = MaxPool1D(pool_size=2)(x)
-        x = LSTM(64, return_sequences=False)(x)
-        x = Dropout(0.5)(x)
-        x = Dense(64, activation='relu')(x)
-        x = Dropout(0.5)(x)
-        output = Dense(1, activation='sigmoid')(x)  # Assuming binary classification for buy/sell decision
+
+        # Second LSTM layer with fewer units and without returning sequences
+        x = LSTM(32, return_sequences=False)(x)
+        x = Dropout(0.2)(x)  # Keeping dropout consistent
+
+        # Dense layer before the final output
+        x = Dense(16, activation='relu')(x)  # Increased units in the dense layer
+        x = Dropout(0.2)(x)  # Keeping dropout consistent
+
+        output = Dense(1, activation='sigmoid')(x)
 
         model = Model(inputs=input_layer, outputs=output)
         model.compile(loss='binary_crossentropy', optimizer='nadam', metrics=['accuracy'])
 
-        early_stop = EarlyStopping(monitor='val_loss', patience=10, verbose=1, mode='min', restore_best_weights=True)
+        early_stop = EarlyStopping(monitor='val_loss', patience=20, verbose=1, mode='min', restore_best_weights=True)
 
-        trainHistory = model.fit(X_train_reshaped, self.y_train, epochs=100, batch_size=64,
-                                 validation_data=(X_test_reshaped, self.y_test), callbacks=[self.tensorboard_callback, self.lr_schedule])
+        callbacks = [early_stop, self.tensorboard_callback, self.lr_schedule]
+
+        trainHistory = model.fit(X_train_reshaped, self.y_train, epochs=100, batch_size=32000,
+                                 validation_data=(X_test_reshaped, self.y_test), callbacks=callbacks)
 
         return trainHistory, trainHistory.history['val_accuracy'][-1], trainHistory.history['val_loss'][-1]
 
@@ -680,6 +730,6 @@ if __name__ == '__main__':
     trainHistory, accuracy, loss = mt.LSTMCNN_model()
     #
     # # Plot the training history
-    plot_training_history(trainHistory, "LSTMCNN")
+    plot_training_history(trainHistory, "LSTM")
 
     print(accuracy, loss)
